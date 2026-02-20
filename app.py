@@ -1,5 +1,5 @@
 """
-PortfolioPulse — Model Portfolio Platform Backend
+StonksAI — Model Portfolio Platform Backend
 ===================================================
 Features:
 - Google OAuth + Email/Password auth (JWT)
@@ -30,8 +30,9 @@ import yfinance as yf
 app = Flask(__name__)
 
 ALLOWED_ORIGINS = [
-    "https://portfoliopulse.in",
-    "https://www.portfoliopulse.in",
+    "https://stonksai.in",
+    "https://www.stonksai.in",
+    "https://stonksaigame.onrender.com",
     "http://localhost:3000",
     "http://localhost:5000",
     "http://127.0.0.1:5500",
