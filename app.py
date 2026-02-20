@@ -1,5 +1,5 @@
 """
-StonksAI — Model Portfolio Platform Backend
+PortfolioPulse — Model Portfolio Platform Backend
 ===================================================
 Features:
 - Google OAuth + Email/Password auth (JWT)
@@ -960,11 +960,27 @@ def admin_stats():
 def health():
     return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
 
-# ═══════ INIT ═══════
+# ═══════ INIT + MIGRATIONS ═══════
+
+def run_migrations():
+    """Safely add any missing columns to existing tables (won't fail if already exist)."""
+    migrations = [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin_url VARCHAR(500) DEFAULT ''",
+    ]
+    with db.engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(db.text(sql))
+                conn.commit()
+                log.info(f"[MIGRATION] Applied: {sql[:70]}")
+            except Exception as e:
+                log.warning(f"[MIGRATION] Skipped ({sql[:40]}...): {e}")
 
 with app.app_context():
     db.create_all()
-    log.info("[DB] Tables created/verified")
+    run_migrations()
+    log.info("[DB] Ready")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
