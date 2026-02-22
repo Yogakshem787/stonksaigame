@@ -12,7 +12,7 @@ Features:
 - PostgreSQL (Render-compatible)
 """
 
-import os, time, math, logging, hashlib, secrets, json, re
+import os, time, math, logging, hashlib, secrets, json, re, io, csv
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -307,6 +307,15 @@ class CompetitionParticipant(db.Model):
 
     user = db.relationship("User")
 
+
+class StockMaster(db.Model):
+    """NSE/BSE stock master list — populated via admin Excel upload. Used for instant search."""
+    __tablename__ = "stock_master"
+    symbol   = db.Column(db.String(30), primary_key=True)
+    name     = db.Column(db.String(300), default="", index=True)
+    sector   = db.Column(db.String(100), default="")
+    exchange = db.Column(db.String(10), default="NSE")
+
     def to_dict(self):
         portfolio = ModelPortfolio.query.filter_by(user_id=self.user_id).first()
         return {
@@ -362,17 +371,81 @@ def optional_auth(f):
 
 # ═══════ STOCK PRICE HELPERS ═══════
 
-_price_cache = {}  # symbol -> (price, timestamp)
-CACHE_TTL = 3600  # 1 hour
+_price_cache = {}   # symbol -> (price, timestamp)
+_name_cache  = {}   # symbol -> name
+CACHE_TTL = 3600    # 1 hour
+
+def search_stock_master(q):
+    """Instant DB search — no external API calls."""
+    ql = q.strip().upper()
+    if not ql:
+        return []
+    try:
+        results = []
+        exact = StockMaster.query.get(ql)
+        if exact:
+            results.append({"symbol": exact.symbol, "name": exact.name})
+        starts = StockMaster.query.filter(
+            StockMaster.symbol.ilike(f"{ql}%"),
+            StockMaster.symbol != ql
+        ).order_by(StockMaster.symbol).limit(6).all()
+        for s in starts:
+            if not any(r["symbol"] == s.symbol for r in results):
+                results.append({"symbol": s.symbol, "name": s.name})
+        if len(results) < 8:
+            name_hits = StockMaster.query.filter(
+                StockMaster.name.ilike(f"%{q.strip()}%"),
+                ~StockMaster.symbol.ilike(f"{ql}%")
+            ).order_by(StockMaster.name).limit(8).all()
+            for s in name_hits:
+                if not any(r["symbol"] == s.symbol for r in results):
+                    results.append({"symbol": s.symbol, "name": s.name})
+        if len(results) < 8:
+            sym_contains = StockMaster.query.filter(
+                StockMaster.symbol.ilike(f"%{ql}%"),
+                ~StockMaster.symbol.ilike(f"{ql}%"),
+                StockMaster.symbol != ql
+            ).order_by(StockMaster.symbol).limit(5).all()
+            for s in sym_contains:
+                if not any(r["symbol"] == s.symbol for r in results):
+                    results.append({"symbol": s.symbol, "name": s.name})
+        return results[:8]
+    except Exception as e:
+        log.warning(f"[STOCK MASTER] DB search failed: {e}")
+        return []
+
 
 def get_stock_price(symbol):
-    """Fetch NSE stock price via yfinance. Returns price or None."""
+    """
+    Fetch live NSE price. Priority:
+      1. In-memory cache (1hr TTL)
+      2. nsetools (fast, direct from NSE — no rate limits)
+      3. yfinance (fallback)
+    """
     now = time.time()
     if symbol in _price_cache:
         price, ts = _price_cache[symbol]
         if now - ts < CACHE_TTL:
             return price
 
+    # Source 1: nsetools
+    try:
+        from nsetools import Nse
+        nse = Nse()
+        q = nse.get_quote(symbol)
+        if q:
+            price = q.get("lastPrice") or q.get("closePrice") or 0
+            if price and price > 0:
+                _price_cache[symbol] = (price, now)
+                cname = q.get("companyName")
+                if cname:
+                    _name_cache[symbol] = cname
+                log.info(f"[PRICE] nsetools ✅ {symbol}: ₹{price}")
+                return price
+    except Exception as e:
+        log.debug(f"[PRICE] nsetools failed for {symbol}: {e}")
+
+    # Source 2: yfinance fallback
     ticker = symbol if symbol.endswith(".NS") else symbol + ".NS"
     try:
         t = yf.Ticker(ticker)
@@ -380,24 +453,36 @@ def get_stock_price(symbol):
         price = getattr(info, "last_price", None) or getattr(info, "regularMarketPrice", None)
         if price and price > 0:
             _price_cache[symbol] = (price, now)
+            log.info(f"[PRICE] yfinance ✅ {symbol}: ₹{price}")
             return price
-        # fallback: history
         hist = t.history(period="2d")
         if not hist.empty:
             price = float(hist["Close"].iloc[-1])
             _price_cache[symbol] = (price, now)
             return price
     except Exception as e:
-        log.warning(f"[PRICE] {symbol}: {e}")
+        log.warning(f"[PRICE] yfinance failed for {symbol}: {e}")
     return None
 
+
 def get_stock_name(symbol):
-    """Try to get company name from yfinance."""
+    """Get company name. Priority: cache → stock_master DB → yfinance."""
+    if symbol in _name_cache:
+        return _name_cache[symbol]
+    try:
+        sm = StockMaster.query.get(symbol)
+        if sm and sm.name:
+            _name_cache[symbol] = sm.name
+            return sm.name
+    except Exception:
+        pass
     ticker = symbol if symbol.endswith(".NS") else symbol + ".NS"
     try:
         t = yf.Ticker(ticker)
         info = t.info
-        return info.get("longName") or info.get("shortName") or symbol
+        name = info.get("longName") or info.get("shortName") or symbol
+        _name_cache[symbol] = name
+        return name
     except Exception:
         return symbol
 
@@ -528,45 +613,32 @@ def update_profile():
 
 @app.route("/api/stocks/search", methods=["GET"])
 def search_stocks():
-    q = (request.args.get("q") or "").strip().upper()
+    q = (request.args.get("q") or "").strip()
     if len(q) < 1:
         return jsonify({"results": []})
-    # Use yfinance search
+
+    # Step 1: instant DB search (stock_master table — populated via admin Excel upload)
+    db_results = search_stock_master(q)
+    if db_results:
+        results = [{"symbol": r["symbol"], "name": r["name"], "price": 0, "exchange": "NSE"} for r in db_results]
+        return jsonify({"results": results})
+
+    # Step 2: fallback Yahoo search (only if stock_master is empty)
     try:
+        search_r = requests.get(
+            f"https://query2.finance.yahoo.com/v1/finance/search?q={q}&lang=en-US&region=IN&quotesCount=8&newsCount=0&listsCount=0",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5
+        )
+        quotes = search_r.json().get("quotes", [])
         results = []
-        # Try direct NSE ticker first
-        ticker_ns = q + ".NS"
-        t = yf.Ticker(ticker_ns)
-        info = t.fast_info
-        price = getattr(info, "last_price", None)
-        if price and price > 0:
-            full_info = t.info
-            results.append({
-                "symbol": q,
-                "name": full_info.get("longName") or full_info.get("shortName") or q,
-                "price": round(price, 2),
-                "exchange": "NSE",
-            })
-        if not results:
-            # Try yfinance search
-            search_r = requests.get(
-                f"https://query2.finance.yahoo.com/v1/finance/search?q={q}&lang=en-US&region=IN&quotesCount=8&newsCount=0&listsCount=0",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=5
-            )
-            quotes = search_r.json().get("quotes", [])
-            for qt in quotes:
-                if qt.get("exchange") in ("NSI", "BSE") or qt.get("symbol", "").endswith(".NS") or qt.get("symbol", "").endswith(".BO"):
-                    sym = qt.get("symbol", "").replace(".NS", "").replace(".BO", "")
-                    results.append({
-                        "symbol": sym,
-                        "name": qt.get("longname") or qt.get("shortname") or sym,
-                        "price": 0,
-                        "exchange": "NSE",
-                    })
+        for qt in quotes:
+            if qt.get("exchange") in ("NSI", "BSE") or qt.get("symbol", "").endswith(".NS") or qt.get("symbol", "").endswith(".BO"):
+                sym = qt.get("symbol", "").replace(".NS", "").replace(".BO", "")
+                results.append({"symbol": sym, "name": qt.get("longname") or qt.get("shortname") or sym, "price": 0, "exchange": "NSE"})
         return jsonify({"results": results[:8]})
     except Exception as e:
-        log.warning(f"[SEARCH] {q}: {e}")
+        log.warning(f"[SEARCH] fallback failed for '{q}': {e}")
         return jsonify({"results": []})
 
 
@@ -940,6 +1012,149 @@ def leaderboard():
     return jsonify({"leaderboard": [p.to_dict() for p in top]})
 
 # ═══════ ADMIN ═══════
+
+@app.route("/api/admin/stockmaster/upload", methods=["POST"])
+@require_auth
+def admin_upload_stockmaster():
+    """
+    Upload NSE or BSE Excel/CSV to populate stock_master table.
+    Admin only. Accepts .xlsx, .xls, .csv.
+    Flexible column detection — works with NSE EQUITY_L.csv, BSE bhav copy, or custom files.
+    """
+    if not g.user.is_admin:
+        return jsonify({"error": "Unauthorized"}), 403
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "No file selected"}), 400
+
+    ext = file.filename.rsplit(".", 1)[-1].lower()
+    if ext not in ("csv", "xlsx", "xls"):
+        return jsonify({"error": "Please upload a .csv, .xlsx or .xls file"}), 400
+
+    exchange_hint = (request.form.get("exchange") or "NSE").strip().upper()  # NSE or BSE
+
+    try:
+        rows = []
+        if ext in ("xlsx", "xls"):
+            import openpyxl
+            wb = openpyxl.load_workbook(file.stream, read_only=True, data_only=True)
+            ws = wb.active
+            data = list(ws.values)
+            if not data:
+                return jsonify({"error": "Excel file is empty"}), 400
+            headers_raw = [str(c).strip() if c is not None else "" for c in data[0]]
+            rows = [
+                {headers_raw[i]: (str(cell).strip() if cell is not None else "") for i, cell in enumerate(row)}
+                for row in data[1:]
+            ]
+        else:
+            stream = io.StringIO(file.stream.read().decode("utf-8", errors="replace"), newline=None)
+            reader = csv.DictReader(stream)
+            rows = [{k: (str(v).strip() if v else "") for k, v in row.items()} for row in reader]
+            headers_raw = list(rows[0].keys()) if rows else []
+
+        if not rows:
+            return jsonify({"error": "File has no data rows"}), 400
+
+        headers = [h.strip().lower() for h in headers_raw]
+
+        # Flexible column detection — handles NSE, BSE, and custom formats
+        def find_col(patterns):
+            for p in patterns:
+                for h in headers:
+                    if re.search(p, h, re.IGNORECASE):
+                        return headers_raw[headers.index(h)]
+            return None
+
+        sym_col    = find_col([r"^symbol", r"^trading.*symbol", r"^scrip.*code", r"^ticker", r"^sc_code", r"^security.*code"])
+        name_col   = find_col([r"^name", r"^company", r"^scrip.*name", r"^security.*name", r"^issuer", r"^sc_name"])
+        sector_col = find_col([r"^sector", r"^industry", r"^series"])
+        exch_col   = find_col([r"^exchange", r"^market", r"^segment"])
+
+        if not sym_col:
+            return jsonify({"error": f"Could not find Symbol column. Headers found: {', '.join(headers[:8])}"}), 400
+        if not name_col:
+            return jsonify({"error": f"Could not find Name column. Headers found: {', '.join(headers[:8])}"}), 400
+
+        added = updated = skipped = 0
+
+        for row in rows:
+            sym_raw  = (row.get(sym_col) or "").strip().upper()
+            name_raw = (row.get(name_col) or "").strip()
+            sector   = (row.get(sector_col) or "").strip() if sector_col else ""
+            exchange = (row.get(exch_col) or exchange_hint).strip().upper() if exch_col else exchange_hint
+
+            # Clean symbol
+            sym = re.sub(r"\.(NS|BO|BSE|NSE)$", "", sym_raw)
+            sym = re.sub(r"[^A-Z0-9&\-]", "", sym)
+
+            if not sym or len(sym) > 30 or not name_raw or name_raw.upper() in ("NAME OF COMPANY", "COMPANY NAME", "SECURITY NAME"):
+                skipped += 1
+                continue
+
+            existing = StockMaster.query.get(sym)
+            if existing:
+                existing.name     = name_raw
+                existing.exchange = exchange
+                if sector:
+                    existing.sector = sector
+                updated += 1
+            else:
+                db.session.add(StockMaster(symbol=sym, name=name_raw, sector=sector, exchange=exchange))
+                added += 1
+
+        db.session.commit()
+
+        # Clear name cache so fresh names are used
+        _name_cache.clear()
+
+        total = StockMaster.query.count()
+        log.info(f"[STOCKMASTER] Upload ({exchange_hint}): added={added}, updated={updated}, skipped={skipped}, total={total}")
+        return jsonify({
+            "success": True,
+            "added": added, "updated": updated, "skipped": skipped, "total": total,
+            "message": f"Done! {added} added, {updated} updated. Total stocks in DB: {total}",
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"[STOCKMASTER] Upload error: {e}")
+        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
+
+
+@app.route("/api/admin/stockmaster/stats", methods=["GET"])
+@require_auth
+def admin_stockmaster_stats():
+    """Stock master table counts — used by admin panel."""
+    if not g.user.is_admin:
+        return jsonify({"error": "Unauthorized"}), 403
+    try:
+        total = StockMaster.query.count()
+        nse   = StockMaster.query.filter_by(exchange="NSE").count()
+        bse   = StockMaster.query.filter_by(exchange="BSE").count()
+        return jsonify({"total": total, "nse": nse, "bse": bse})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/admin/stockmaster/clear", methods=["POST"])
+@require_auth
+def admin_clear_stockmaster():
+    """Clear stock_master table entirely (before a fresh re-upload)."""
+    if not g.user.is_admin:
+        return jsonify({"error": "Unauthorized"}), 403
+    try:
+        deleted = StockMaster.query.delete()
+        db.session.commit()
+        _name_cache.clear()
+        log.info(f"[STOCKMASTER] Cleared {deleted} stocks")
+        return jsonify({"success": True, "deleted": deleted})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/admin/stats", methods=["GET"])
 @require_auth
